@@ -14,6 +14,11 @@ on:
         description: "Correr en modo prueba (no envía nada)"
         type: boolean
         default: false
+      solo:
+        description: "Solo una parte (pedidos = refrescar datos de pedidos, sin gracias ni preguntas)"
+        type: choice
+        options: [todo, pedidos]
+        default: todo
 concurrency: {group: kpp-vigia, cancel-in-progress: false}   # nunca dos corridas a la vez (token rotatorio)
 permissions: {contents: read}
 jobs:
@@ -35,7 +40,7 @@ jobs:
           ML_CLIENT_ID: ${{ secrets.ML_CLIENT_ID }}
           ML_CLIENT_SECRET: ${{ secrets.ML_CLIENT_SECRET }}
           ML_LIVE: ${{ github.event.inputs.dry_run == 'true' && '0' || '1' }}
-        run: python ml_bot.py ${{ github.event.inputs.dry_run != 'true' && '--live' || '' }} ${{ github.event.inputs.refresh == 'true' && '--refresh' || '' }}
+        run: python ml_bot.py ${{ github.event.inputs.dry_run != 'true' && '--live' || '' }} ${{ github.event.inputs.refresh == 'true' && '--refresh' || '' }} ${{ github.event.inputs.solo == 'pedidos' && '--solo pedidos' || '' }}
       - name: Subir estado cifrado (siempre, guarda el refresh token nuevo)
         if: always()
         run: python deploy/sync_gist.py push

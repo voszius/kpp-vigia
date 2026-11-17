@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Pedidos de Mercado Libre YA ORGANIZADOS para el bot de ML (corre en la caja, sin IA).
 
+Primero dispara kpp-vigia en GitHub solo con pedidos y espera (~30-60 s) para que los datos
+estén al momento; si no se puede, avisa desde cuándo son los datos.
 Baja el estado CIFRADO del gist (solo lectura: nunca escribe el gist, nunca toca tokens),
 lo descifra en memoria y deja en /workspace/ml_api/pedidos_listos/:
     <venta>.txt         texto listo para pegar (bloque + mensaje de precio) y datos para la foto
@@ -15,7 +17,7 @@ Uso:
     python3 pedidos.py camacho                   # por comprador o apodo
     python3 pedidos.py camacho --numero 420      # pone el número de pedido en el texto
 """
-import argparse, glob, io, json, os, re, sys, warnings
+import argparse, glob, io, json, os, re, sys, time, warnings
 from datetime import datetime, timedelta, timezone
 import requests
 from cryptography.fernet import Fernet
@@ -40,6 +42,58 @@ def bajar_estado():
     f = r.json()["files"]["state.json.enc"]
     txt = f["content"] if not f.get("truncated") else requests.get(f["raw_url"], headers=h, timeout=60).text
     return json.loads(Fernet(k["state_key"].encode()).decrypt(txt.strip().encode()))   # solo en memoria
+
+REPO = "voszius/kpp-vigia"
+def _gh():
+    tok = os.environ.get("GH_TOKEN")
+    return {"Accept": "application/vnd.github+json", **({"Authorization": "Bearer " + tok} if tok else {})}
+
+def gist_fecha():
+    """Hora (Colombia) de la última vez que el programa guardó el estado en el gist."""
+    try:
+        k = json.load(open(os.path.join(HERE, ".gist_key")))
+        r = requests.get(f"https://api.github.com/gists/{k['gist_id']}", headers=_gh(), timeout=20); r.raise_for_status()
+        return datetime.fromisoformat(r.json()["updated_at"].replace("Z", "+00:00")).astimezone(BOGOTA)
+    except Exception:
+        return None
+
+def refrescar(max_s=150, quiet=False):
+    """Dispara kpp-vigia en GitHub SOLO con pedidos (lee ML y guarda el estado cifrado) y espera.
+    Así los datos salen al momento aunque el cron de GitHub vaya atrasado. No toca tokens en la caja."""
+    say = (lambda *x: print(*x, file=sys.stderr, flush=True))
+    t0 = time.time(); desde = datetime.now(timezone.utc) - timedelta(seconds=5)
+    try:
+        if not os.environ.get("GH_TOKEN"): raise RuntimeError("falta GH_TOKEN")
+        r = requests.post(f"https://api.github.com/repos/{REPO}/actions/workflows/ml.yml/dispatches",
+                          headers=_gh(), json={"ref": "main", "inputs": {"solo": "pedidos"}}, timeout=20)
+        if r.status_code != 204: raise RuntimeError(f"disparo HTTP {r.status_code}")
+        if not quiet: say("Actualizando pedidos desde Mercado Libre (GitHub)...")
+        run = None
+        while time.time() - t0 < max_s:
+            time.sleep(5)
+            q = requests.get(f"https://api.github.com/repos/{REPO}/actions/workflows/ml.yml/runs",
+                             headers=_gh(), params={"event": "workflow_dispatch", "per_page": 5}, timeout=20).json()
+            for x in q.get("workflow_runs", []):
+                if datetime.fromisoformat(x["created_at"].replace("Z", "+00:00")) >= desde:
+                    run = x; break
+            if run and run["status"] == "completed": break
+        if not run or run["status"] != "completed":
+            raise RuntimeError(f"la corrida no terminó en {max_s} s")
+        if run["conclusion"] != "success": raise RuntimeError(f"la corrida terminó en {run['conclusion']}")
+        if not quiet: say(f"Datos al día ({int(time.time() - t0)} s).")
+        return True
+    except Exception as e:
+        f = gist_fecha()
+        say(f"⚠️ OJO: no se pudo actualizar ({e}). Los datos pueden estar VIEJOS: son de "
+            f"{f.strftime('%d-%b %I:%M %p') + ' (hora Colombia)' if f else 'hora desconocida'}. "
+            "Ventas posteriores pueden no salir: revisa en Mercado Libre.")
+        return False
+
+def asegurar_vigia():
+    """Si el disparador cada 10 min de la caja (deploy/vigia_caja.sh) no está corriendo, lo arranca."""
+    sh = os.path.join(HERE, "deploy", "vigia_caja.sh")
+    if os.path.exists(sh) and os.environ.get("GH_TOKEN"):
+        os.system(f"bash {sh} start >/dev/null 2>&1")
 
 def _load(p, d):
     try:
@@ -142,7 +196,10 @@ def main():
     ap.add_argument("--numero", type=int, help="número de pedido a poner (solo si sale UN pedido)")
     ap.add_argument("--sin-foto", action="store_true")
     ap.add_argument("--json", action="store_true", help="imprime JSON en vez de texto")
+    ap.add_argument("--sin-refrescar", action="store_true", help="no dispara la corrida en GitHub (usa el gist tal cual)")
     a = ap.parse_args()
+    if not a.sin_refrescar: refrescar(quiet=a.json)
+    asegurar_vigia()
     st = bajar_estado()
     peds = [p for p in (st.get("pedidos") or {}).values() if p.get("estado") == "pagada"]
     env, siguiente, excl = bodega()

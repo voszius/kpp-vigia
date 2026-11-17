@@ -1,7 +1,13 @@
 # Pedidos de Mercado Libre ya listos (para el bot de Mercado Libre)
 
-Desde el 17-nov-2026 el programa **kpp-vigia** (GitHub, cada 5 min) ya lee por API cada venta pagada y deja
-sus datos organizados en el estado cifrado. **Ya no hace falta entrar a Mercado Libre a leer los datos del pedido.**
+Desde el 17-nov-2026 el programa **kpp-vigia** (GitHub) lee por API cada venta pagada y deja sus datos
+organizados en el estado cifrado. **Ya no hace falta entrar a Mercado Libre a leer los datos del pedido.**
+
+**`pedidos.py` trae SIEMPRE lo más reciente:** antes de mostrar nada dispara kpp-vigia en GitHub solo con
+pedidos y espera a que termine (unos 30-60 s), así una venta de hace un minuto ya sale. Si no se puede
+actualizar, imprime «⚠️ OJO: no se pudo actualizar… los datos son de <hora>»: en ese caso revisa en Mercado
+Libre que no falte ninguna venta. (`--sin-refrescar` lo salta, solo para pruebas.)
+Además la caja dispara kpp-vigia cada 10 min (`deploy/vigia_caja.sh`; pedidos.py lo arranca solo si se cayó).
 Tu trabajo: cuando Kevin diga «manda el pedido», tomar el texto listo, hacer la foto del cobro y mandarlo
 (con Wapi) al grupo «Pedidos mercado libre», como siempre.
 
@@ -40,6 +46,6 @@ sigues asignando tú al mandar, igual que antes (consecutivo compartido con Shop
 
 ## Reglas
 
-- El script es solo lectura: baja el gist, no lo escribe y no toca tokens. No lo cambies para refrescar tokens.
+- El script no escribe el gist ni toca tokens (solo dispara la corrida en GitHub y luego lee). No lo cambies para refrescar tokens.
 - No pegues estos datos en ningún log ni en GitHub (el repo es público).
 - Full: el bloque ya sale sin dirección y con «No se despacha lo envía mercado libre».
