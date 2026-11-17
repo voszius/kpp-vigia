@@ -4,24 +4,24 @@
 Hace, en cada corrida (pensado para correr cada 5 min):
   1) Gracias post-venta: busca ventas pagadas recientes, revisa el chat del pack
      y si el vendedor no ha escrito nada, manda el texto de gracias (opcion OTHER).
-  2) Aviso al dueño: tras cada gracias enviado, SOLO "Listo el gracias".
+  2) Verifica que el gracias quedó en el chat (relee el pack; 1 reintento) y deja
+     "Listo el gracias" SOLO en el estado cifrado (sin correos).
   3) Preguntas: responde con plantilla las comunes (precio, envio, stock) usando
-     datos reales del item; las complejas despiertan al bot de Mercado Libre.
+     datos reales del item; las complejas (o si no se puede leer el ítem) quedan
+     marcadas en el estado para el bot de Mercado Libre. No se manda ningún correo.
   Nunca manda nada al grupo de WhatsApp.
 
-Por defecto es --dry-run: NO envia mensajes, NO responde, NO avisa.
+Por defecto es --dry-run: NO envia mensajes, NO responde.
 Envio real solo con --live (y ML_LIVE=1 en el entorno, doble seguro).
 
 Secretos por entorno (nunca se imprimen):
   ML_CLIENT_SECRET            secreto de la app
   ML_TOKENS_PATH              ruta del tokens.json (default ./tokens.json)
-  NOTIFY_SMTP_USER/PASS/TO    correo para "Listo el gracias" (Gmail + app password)
-  WAKE_WEBHOOK_URL            webhook de la rutina del bot (preguntas complejas)
-  WAKE_EMAIL                  alternativa: correo que dispara la rutina
+  WAKE_WEBHOOK_URL            (opcional) webhook de la rutina del bot (preguntas complejas)
+  ML_ALERT_FILE               archivo donde se escribe la alerta (gracias fallido) para el workflow
 """
-import argparse, json, os, re, smtplib, sys, tempfile, time, unicodedata
+import argparse, json, os, re, sys, tempfile, time, unicodedata
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
 import requests
 
 API = "https://api.mercadolibre.com"
@@ -112,47 +112,77 @@ class ML:
 # ---------------------------------------------------------------- estado
 def load_state():
     try:
-        with open(STATE_PATH) as f: return json.load(f)
+        with open(STATE_PATH) as f: st = json.load(f)
     except FileNotFoundError:
-        return {"gracias": [], "preguntas_respondidas": [], "preguntas_escaladas": []}
+        st = {}
+    for k in ("gracias", "preguntas_respondidas", "preguntas_escaladas", "avisos"): st.setdefault(k, [])
+    for k in ("gracias_detalle", "preguntas_para_bot"): st.setdefault(k, {})
+    return st
 
 def save_state(st):
     for k in st:  # recorta para que no crezca sin limite
         if isinstance(st[k], list): st[k] = st[k][-2000:]
+        elif isinstance(st[k], dict) and len(st[k]) > 2000: st[k] = dict(list(st[k].items())[-2000:])
     _write_secure(STATE_PATH, st)
 
 # ---------------------------------------------------------------- avisos (sin IA)
-def avisar_kevin(texto, live):
-    if not live:
-        det(f"[dry-run] avisaria al dueño: {texto!r}"); return
-    u, p, to = (os.environ.get(k) for k in ("NOTIFY_SMTP_USER", "NOTIFY_SMTP_PASS", "NOTIFY_TO"))
-    if not (u and p and to):
-        log("aviso NO enviado: falta NOTIFY_SMTP_*"); return
-    m = EmailMessage(); m["From"], m["To"], m["Subject"] = u, to, texto
-    m.set_content(texto)
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
-        s.login(u, p); s.send_message(m)
+def ahora():
+    return datetime.now(BOGOTA).strftime("%Y-%m-%d %H:%M")
 
-def despertar_bot(q, motivo, live):
-    payload = {"tipo": "pregunta_compleja", "question_id": q["id"], "item_id": q["item_id"],
-               "texto": q["text"], "motivo": motivo}
+def avisar_kevin(st, texto, live):
+    """Sin correos (Kevin no los quiere): el aviso queda SOLO en el estado cifrado del gist."""
     if not live:
-        det(f"[dry-run] despertaria al bot ML: q={q['id']} motivo={motivo}"); return True
+        det(f"[dry-run] dejaria aviso en el estado: {texto!r}"); return
+    st["avisos"].append({"fecha": ahora(), "texto": texto})
+
+ALERTAS = []
+def alerta(motivo):
+    """Algo requiere al bot: el workflow termina en aviso (sin datos personales)."""
+    ALERTAS.append(motivo)
+
+def despertar_bot(st, q, motivo, live):
+    """Marca la pregunta en el estado para el bot de ML (y webhook opcional). Sin correos."""
+    if not live:
+        det(f"[dry-run] dejaria para el bot ML: q={q['id']} motivo={motivo}"); return True
+    alerta("pregunta_para_bot")
+    st["preguntas_para_bot"][str(q["id"])] = {"fecha": ahora(), "item_id": q.get("item_id"),
+        "texto": q.get("text"), "motivo": motivo}
     url = os.environ.get("WAKE_WEBHOOK_URL")
     if url:
-        r = requests.post(url, json=payload, timeout=30); return r.status_code < 300
-    to = os.environ.get("WAKE_EMAIL")
-    u, p = os.environ.get("NOTIFY_SMTP_USER"), os.environ.get("NOTIFY_SMTP_PASS")
-    if to and u and p:
-        m = EmailMessage(); m["From"], m["To"] = u, to
-        m["Subject"] = f"[ML pregunta compleja] {q['id']}"
-        m.set_content(json.dumps(payload, ensure_ascii=False, indent=1))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
-            s.login(u, p); s.send_message(m)
-        return True
-    log("no hay canal para despertar al bot"); return False
+        try: requests.post(url, json={"tipo": "pregunta_compleja", "question_id": q["id"], "motivo": motivo}, timeout=30)
+        except Exception as e: log("webhook bot fallo", type(e).__name__)
+    return True
 
 # ---------------------------------------------------------------- 1) gracias
+def _txt(x):
+    t = x.get("text")
+    if isinstance(t, dict): t = t.get("plain") or ""
+    return t or ""
+
+def _cmp(t):
+    return re.sub(r"[^a-z0-9]", "", norm(t))
+
+def mensajes_vendedor(ml, pack_id):
+    m = ml.get(f"/messages/packs/{pack_id}/sellers/{SELLER_ID}", tag="post_sale", mark_as_read="false")
+    if "_http" in m: return None
+    return [x for x in m.get("messages", []) if str((x.get("from") or {}).get("user_id")) == SELLER_ID]
+
+def gracias_en_chat(ml, pack_id):
+    """'ok' si el gracias aparece en el chat; 'otro' si hay mensaje del vendedor distinto;
+    'no' si no hay nada del vendedor; None si no se pudo leer."""
+    mv = mensajes_vendedor(ml, pack_id)
+    if mv is None: return None
+    obj = _cmp(TEXTO_GRACIAS)[:120]
+    if any(obj in _cmp(_txt(x)) for x in mv): return "ok"
+    return "otro" if mv else "no"
+
+def verificar(ml, pack_id, esperas=(4, 10, 20)):
+    r = None
+    for w in esperas:
+        time.sleep(w); r = gracias_en_chat(ml, pack_id)
+        if r == "ok": return r
+    return r
+
 def ya_agradecido(ml, pack_id):
     """True/False/None(no se puede escribir). Fuente de verdad: el chat del pack."""
     m = ml.get(f"/messages/packs/{pack_id}/sellers/{SELLER_ID}", tag="post_sale", mark_as_read="false")
@@ -207,13 +237,27 @@ def correr_gracias(ml, st, live):
         det("SIN GRACIAS ->", pid, resumen_pack(p)); cuenta("ventas_sin_gracias")
         if not live:
             det(f"[dry-run] mandaria gracias a pack {pid}"); continue
-        code, resp = ml.post(f"/messages/action_guide/packs/{pid}/option",
-                             {"option_id": "OTHER", "text": TEXTO_GRACIAS}, tag="post_sale")
-        if code < 300:
-            st["gracias"].append(pid); enviados += 1; cuenta("gracias_enviados"); save_state(st)
-            avisar_kevin(AVISO_KEVIN, live)
+        # Desde aquí el pack queda bloqueado: NUNCA se vuelve a enviar en otra corrida.
+        st["gracias"].append(pid)
+        st["gracias_detalle"][pid] = {"estado": "enviando", "fecha": ahora()}; save_state(st)
+        res, intentos = None, 0
+        for intento in (1, 2):           # 1 envío + 1 reintento como máximo
+            intentos = intento
+            code, _ = ml.post(f"/messages/action_guide/packs/{pid}/option",
+                              {"option_id": "OTHER", "text": TEXTO_GRACIAS}, tag="post_sale")
+            log(f"envío gracias intento {intento}: HTTP {code}")
+            res = verificar(ml, pid)
+            if res == "ok": break
+            if res in ("otro", None): break   # hay algo del vendedor o no se pudo leer: no arriesgar duplicado
+        d = st["gracias_detalle"][pid]; d["intentos"] = intentos
+        if res == "ok":
+            d["estado"] = "verificado"; enviados += 1; cuenta("gracias_enviados"); cuenta("gracias_verificados")
+            avisar_kevin(st, AVISO_KEVIN, live)
         else:
-            det("ERROR enviando gracias", pid, code); cuenta("errores_gracias")
+            d["estado"] = "fallido"; d["motivo"] = {"otro": "hay mensaje del vendedor pero no coincide",
+                None: "no se pudo releer el chat", "no": "no aparece en el chat"}[res]
+            cuenta("gracias_fallidos"); alerta("gracias_fallido")
+        save_state(st)
     return enviados
 
 # ---------------------------------------------------------------- 3) preguntas
@@ -253,6 +297,7 @@ def armar_respuesta(intent, item, tpl):
     if item.get("status") != "active": return None, "publicación no activa"
     ship = item.get("shipping") or {}
     if intent == "precio":
+        if not isinstance(item.get("price"), (int, float)) or item["price"] <= 0: return None, "precio no confiable"
         precio = f"${item['price']:,.0f}".replace(",", ".")
         return tpl["precio"].format(precio=precio), "ok"
     if intent == "envio":
@@ -260,7 +305,7 @@ def armar_respuesta(intent, item, tpl):
         if ship.get("logistic_type") == "fulfillment": key += "_full"
         return tpl.get(key, tpl["envio_normal"]), "ok"
     if intent == "stock":
-        if int(item.get("available_quantity", 0)) <= 0: return None, "sin stock: que decida el dueño"
+        if int(item.get("available_quantity") or 0) <= 0: return None, "sin stock: que decida el dueño"
         return tpl["stock"], "ok"
     return None, "sin plantilla"
 
@@ -290,10 +335,14 @@ def correr_preguntas(ml, st, live, pruebas=None, item_mock=None):
             if live:
                 code, _ = ml.post("/answers", {"question_id": q["id"], "text": texto})
                 if code < 300: st["preguntas_respondidas"].append(q["id"]); cuenta("respuestas_enviadas")
-                else: det("ERROR respondiendo", q["id"], code)
+                else:
+                    det("ERROR respondiendo", q["id"], code); cuenta("errores_respuesta")
+                    if live:
+                        despertar_bot(st, q, f"error API respondiendo HTTP {code}", live)
+                        st["preguntas_escaladas"].append(q["id"]); cuenta("preguntas_para_bot")
         else:
-            if despertar_bot(q, motivo, live) and live:
-                cuenta("bot_despertado")
+            if despertar_bot(st, q, motivo, live) and live:
+                cuenta("preguntas_para_bot")
                 st["preguntas_escaladas"].append(q["id"])
 
 PRUEBAS = ["¿Cuánto vale?", "Hola, ¿tienen disponible?", "Hacen envíos a Pasto?", "El envío es gratis?",
@@ -324,6 +373,11 @@ def main():
             "available_quantity": 10, "shipping": {"free_shipping": True, "logistic_type": "cross_docking"}})
     if live: save_state(st)
     log("RESUMEN", json.dumps(C, sort_keys=True))
+    if ALERTAS:
+        af = os.environ.get("ML_ALERT_FILE")
+        if af:
+            with open(af, "w") as f: f.write(",".join(sorted(set(ALERTAS))))
+        log("ALERTA para el bot:", ",".join(sorted(set(ALERTAS))))
 
 if __name__ == "__main__":
     try:
