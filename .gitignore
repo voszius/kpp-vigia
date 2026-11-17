@@ -2,3 +2,5 @@ __pycache__/
 tokens.json
 state.json
 *.enc
+.gist_key
+pedidos_listos/

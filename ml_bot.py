@@ -9,6 +9,8 @@ Hace, en cada corrida (pensado para correr cada 5 min):
   3) Preguntas: responde con plantilla las comunes (precio, envio, stock) usando
      datos reales del item; las complejas (o si no se puede leer el ítem) quedan
      marcadas en el estado para el bot de Mercado Libre. No se manda ningún correo.
+  4) Pedidos listos: guarda en el estado cifrado los datos de cada venta pagada ya organizados
+     (producto, comprador, dirección, envío, cobro, foto del producto) para el bot de ML.
   Nunca manda nada al grupo de WhatsApp.
 
 Por defecto es --dry-run: NO envia mensajes, NO responde.
@@ -221,9 +223,9 @@ def resumen_pack(p):
     fecha = datetime.fromisoformat(o["date_created"]).astimezone(BOGOTA).strftime("%d-%b %H:%M")
     return f"{fecha} | {o['buyer'].get('nickname')} | {prods}"
 
-def correr_gracias(ml, st, live):
+def correr_gracias(ml, st, live, packs=None):
     enviados = 0
-    for p in ventas_sin_gracias(ml):
+    for p in (packs if packs is not None else ventas_sin_gracias(ml)):
         pid = p["pack_id"]
         if "paid" not in p["estados"] or p["estados"] & {"cancelled", "invalid"} or "fraud_risk_detected" in p["tags"]:
             det("OMITIR (no pagada/cancelada)", pid, resumen_pack(p)); cuenta("ventas_omitidas"); continue
@@ -259,6 +261,114 @@ def correr_gracias(ml, st, live):
             cuenta("gracias_fallidos"); alerta("gracias_fallido")
         save_state(st)
     return enviados
+
+
+# ---------------------------------------------------------------- 2b) pedidos listos (solo lectura)
+# Por cada venta pagada guarda en el estado CIFRADO los datos ya organizados para el mensaje
+# a «Pedidos Mercado Libre». Solo hace GET: no imprime datos privados ni cambia nada en ML.
+# No pide la etiqueta: descargarla la marca como impresa en Mercado Libre.
+import formato
+PEDIDOS_MAX = 400
+REFRESCO_PEDIDO_S = 2 * 3600       # re-lee envío/cobro cada 2 h hasta que salga despachado
+ESTADOS_ENVIO_FINALES = {"shipped", "delivered", "not_delivered", "cancelled"}
+
+def _pago_aprobado(ml, o):
+    tot = {"precio": 0.0, "cargos": 0.0, "neto": 0.0, "ok": True}
+    for p in o.get("payments", []):
+        if p.get("status") != "approved": continue
+        c = ml.get(f"/collections/{p['id']}")
+        if "_http" in c: tot["ok"] = False; continue
+        tot["precio"] += float(c.get("transaction_amount") or 0)
+        tot["cargos"] += float(c.get("marketplace_fee") or 0) + float(c.get("mercadopago_fee") or 0) \
+            + float(c.get("finance_fee") or 0)
+        tot["neto"] += float(c.get("net_received_amount") or 0)
+    return tot
+
+def datos_pedido(ml, p, prods, cache_fotos):
+    o0 = p["orders"][0]
+    full_o = ml.get(f"/orders/{o0['id']}")
+    buyer = full_o.get("buyer", o0.get("buyer", {})) if "_http" not in full_o else o0.get("buyer", {})
+    items = []
+    for o in p["orders"]:
+        for it in o["order_items"]:
+            iid = it["item"]["id"]
+            if iid not in cache_fotos:
+                d = ml.get(f"/items/{iid}", attributes="id,pictures,secure_thumbnail")
+                pics = [] if "_http" in d else [x.get("secure_url") or x.get("url") for x in d.get("pictures", [])]
+                cache_fotos[iid] = pics[0] if pics else (None if "_http" in d else d.get("secure_thumbnail"))
+            sabor = next((a.get("value_name") for a in it["item"].get("variation_attributes") or []
+                          if a.get("id") == "FLAVOR"), None)
+            x = {"item_id": iid, "titulo": it["item"]["title"], "cantidad": int(it["quantity"]),
+                 "precio": float(it["unit_price"]), "sabor": sabor, "foto_url": cache_fotos[iid],
+                 "orden": str(o["id"])}
+            x["texto"], x["unidades"], _ = formato.linea_producto(x, prods)
+            items.append(x)
+    envio, envio_costo = {}, 0.0
+    sid = (o0.get("shipping") or {}).get("id")
+    if sid:
+        s = ml.get(f"/shipments/{sid}")
+        if "_http" not in s:
+            a = s.get("receiver_address") or {}
+            l1, l2 = formato.lineas_direccion(a)
+            envio = {"shipment_id": str(sid), "estado": s.get("status"), "subestado": s.get("substatus"),
+                     "logistica": s.get("logistic_type"), "modo": s.get("mode"),
+                     "opcion": (s.get("shipping_option") or {}).get("name"),
+                     "guia": s.get("tracking_number"), "transportadora": s.get("tracking_method"),
+                     "recibe": a.get("receiver_name"), "telefono": a.get("receiver_phone"),
+                     "direccion": {k: a.get(k) for k in ("address_line", "street_name", "street_number",
+                                   "comment", "zip_code")},
+                     "barrio": (a.get("neighborhood") or {}).get("name"),
+                     "ciudad": (a.get("city") or {}).get("name"), "depto": (a.get("state") or {}).get("name"),
+                     "linea_direccion": l1, "linea_ciudad": l2}
+        c = ml.get(f"/shipments/{sid}/costs")
+        if "_http" not in c:
+            envio_costo = sum(float(x.get("cost") or 0) for x in c.get("senders", [])
+                              if str(x.get("user_id")) == SELLER_ID)
+    cobro = {"precio": 0.0, "cargos": 0.0, "neto": 0.0, "ok": True}
+    for o in p["orders"]:
+        t = _pago_aprobado(ml, o)
+        for k in ("precio", "cargos", "neto"): cobro[k] += t[k]
+        cobro["ok"] = cobro["ok"] and t["ok"]
+    cobro["envio"] = envio_costo
+    cobro["total_sin_envio"] = round(cobro["neto"] + envio_costo, 2)       # lo que va en la foto
+    cobro["impuestos"] = round(cobro["precio"] - cobro["cargos"] - cobro["total_sin_envio"], 2)
+    fecha = datetime.fromisoformat(o0["date_created"]).astimezone(BOGOTA).strftime("%Y-%m-%d %H:%M")
+    ped = {"venta": p["pack_id"], "ordenes": [str(o["id"]) for o in p["orders"]], "fecha": fecha,
+           "comprador": {"nombre": formato.nombre_comprador(buyer), "nickname": buyer.get("nickname"),
+                         "id": buyer.get("id")},
+           "items": items, "full": envio.get("logistica") == "fulfillment", "envio": envio, "cobro": cobro,
+           "estado": "pagada", "actualizado": int(time.time())}
+    a = formato.armar(ped, prods=prods)
+    ped["texto"] = {"bloque_sin_numero_ni_cc": a["bloque"], "precio_unitario": a["precio"]}
+    return ped
+
+def correr_pedidos(ml, st, packs):
+    """Devuelve True si cambió algo en st['pedidos']."""
+    st.setdefault("pedidos", {})
+    prods, cache, cambio = formato.productos(), {}, False
+    for p in packs:
+        pid = p["pack_id"]; prev = st["pedidos"].get(pid)
+        if p["estados"] & {"cancelled", "invalid"} and "paid" not in p["estados"] or "fraud_risk_detected" in p["tags"]:
+            if prev and prev.get("estado") != "cancelada":
+                prev["estado"] = "cancelada"; cambio = True; cuenta("pedidos_cancelados")
+            continue
+        if "paid" not in p["estados"]: continue
+        if prev and prev.get("estado") == "pagada":
+            env = (prev.get("envio") or {}).get("estado")
+            if env in ESTADOS_ENVIO_FINALES or time.time() - prev.get("actualizado", 0) < REFRESCO_PEDIDO_S:
+                cuenta("pedidos_ya_listos"); continue
+        try:
+            ped = datos_pedido(ml, p, prods, cache)
+        except Exception as e:
+            log("pedido: error", type(e).__name__); cuenta("pedidos_error"); continue
+        if prev: ped["primera_vez"] = prev.get("primera_vez", prev.get("fecha"))
+        else: ped["primera_vez"] = ahora()
+        st["pedidos"][pid] = ped; cambio = True
+        cuenta("pedidos_actualizados" if prev else "pedidos_nuevos")
+        det("PEDIDO", pid, ped["texto"]["bloque_sin_numero_ni_cc"].replace("\n", " | "))
+    if len(st["pedidos"]) > PEDIDOS_MAX:
+        st["pedidos"] = dict(sorted(st["pedidos"].items(), key=lambda kv: kv[1].get("fecha", ""))[-PEDIDOS_MAX:])
+    return cambio
 
 # ---------------------------------------------------------------- 3) preguntas
 def norm(t):
@@ -354,14 +464,17 @@ PRUEBAS = ["¿Cuánto vale?", "Hola, ¿tienen disponible?", "Hacen envíos a Pas
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true", help="ENVÍA de verdad (requiere también ML_LIVE=1)")
-    ap.add_argument("--solo", choices=["gracias", "preguntas", "pruebas"])
+    ap.add_argument("--solo", choices=["gracias", "preguntas", "pruebas", "pedidos"])
     ap.add_argument("--refresh", action="store_true", help="fuerza renovar el token (prueba)")
     a = ap.parse_args()
     live = a.live and os.environ.get("ML_LIVE") == "1"
     log("MODO", "LIVE (envía)" if live else "DRY-RUN (no envía nada)")
     if a.refresh: refresh(load_tokens())
     ml = ML(); st = load_state()
-    if a.solo in (None, "gracias"): correr_gracias(ml, st, live)
+    packs = ventas_sin_gracias(ml) if a.solo in (None, "gracias", "pedidos") else []
+    cambio_pedidos = False
+    if a.solo in (None, "pedidos"): cambio_pedidos = correr_pedidos(ml, st, packs)
+    if a.solo in (None, "gracias"): correr_gracias(ml, st, live, packs)
     if a.solo in (None, "preguntas"): correr_preguntas(ml, st, live)
     if a.solo == "pruebas":
         item = "MCO4494424926"
@@ -372,6 +485,8 @@ def main():
         correr_preguntas(ml, st, False, qs, item_mock={"status": "active", "price": 65000,
             "available_quantity": 10, "shipping": {"free_shipping": True, "logistic_type": "cross_docking"}})
     if live: save_state(st)
+    elif cambio_pedidos:   # en dry-run solo se guardan los pedidos (lectura pura): el resto no cambia
+        st0 = load_state(); st0["pedidos"] = st["pedidos"]; save_state(st0)
     log("RESUMEN", json.dumps(C, sort_keys=True))
     if ALERTAS:
         af = os.environ.get("ML_ALERT_FILE")
