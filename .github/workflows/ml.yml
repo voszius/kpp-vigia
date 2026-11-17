@@ -1,0 +1,34 @@
+# Repo PÚBLICO: los logs solo muestran conteos (sin nombres, ids ni textos).
+# MODO PRUEBA: se corre SIN --live, así que no envía gracias, respuestas ni correos.
+name: kpp-vigia
+on:
+  schedule: [{cron: "*/5 * * * *"}]
+  workflow_dispatch:
+    inputs:
+      refresh:
+        description: "Forzar renovación del token (prueba)"
+        type: boolean
+        default: false
+concurrency: {group: kpp-vigia, cancel-in-progress: false}   # nunca dos corridas a la vez (token rotatorio)
+permissions: {contents: read}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GIST_ID: ${{ secrets.GIST_ID }}
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      STATE_KEY: ${{ secrets.STATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -q requests cryptography
+      - name: Bajar estado cifrado
+        run: python deploy/sync_gist.py pull
+      - name: Revisar ventas y preguntas (modo prueba)
+        env:
+          ML_CLIENT_ID: ${{ secrets.ML_CLIENT_ID }}
+          ML_CLIENT_SECRET: ${{ secrets.ML_CLIENT_SECRET }}
+        run: python ml_bot.py ${{ github.event.inputs.refresh == 'true' && '--refresh' || '' }}
+      - name: Subir estado cifrado (siempre, guarda el refresh token nuevo)
+        if: always()
+        run: python deploy/sync_gist.py push
