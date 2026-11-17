@@ -2,8 +2,9 @@
 """Programa SIN IA para una tienda de Mercado Libre (KPP).
 
 Hace, en cada corrida (pensado para correr cada 5 min):
-  1) Gracias post-venta: busca ventas pagadas recientes, revisa el chat del pack
-     y si el vendedor no ha escrito nada, manda el texto de gracias (opcion OTHER).
+  1) Gracias post-venta: busca ventas pagadas recientes y revisa si el chat del pack tiene un
+     mensaje del vendedor VISIBLE (no rechazado en moderación). ML rechaza el gracias por API
+     (AUTOMATIC_MESSAGE), así que por defecto NO lo manda: lo deja en gracias_para_bot del estado.
   2) Verifica que el gracias quedó en el chat (relee el pack; 1 reintento) y deja
      "Listo el gracias" SOLO en el estado cifrado (sin correos).
   3) Preguntas: responde con plantilla las comunes (precio, envio, stock) usando
@@ -39,7 +40,9 @@ TEXTO_GRACIAS = ("Muchas gracias por haber comprado nuestros productos. Recuerda
     "nacional. Si tienes cualquier duda o reclamo, no dudes en escribirnos por el chat de "
     "Mercado Libre. Esperamos con ansias una nueva compra. ❤️🍃✨")
 AVISO_KEVIN = "Listo el gracias"
-VENTANA_HORAS = 72          # solo agradece ventas de los ultimos 3 dias
+VENTANA_HORAS = 72
+# Mandar el gracias por API queda APAGADO: ML lo rechaza como AUTOMATIC_MESSAGE (17-nov-2026, 3 de 3).
+GRACIAS_POR_API = os.environ.get("ML_GRACIAS_API") == "1"          # solo agradece ventas de los ultimos 3 dias
 RESPUESTAS = os.path.join(HERE, "plantillas.json")
 
 # En GitHub Actions (repo público) NUNCA se imprimen nombres, ids ni textos: solo conteos.
@@ -118,7 +121,7 @@ def load_state():
     except FileNotFoundError:
         st = {}
     for k in ("gracias", "preguntas_respondidas", "preguntas_escaladas", "avisos"): st.setdefault(k, [])
-    for k in ("gracias_detalle", "preguntas_para_bot"): st.setdefault(k, {})
+    for k in ("gracias_detalle", "preguntas_para_bot", "gracias_para_bot"): st.setdefault(k, {})
     return st
 
 def save_state(st):
@@ -164,19 +167,44 @@ def _txt(x):
 def _cmp(t):
     return re.sub(r"[^a-z0-9]", "", norm(t))
 
+def visible(x):
+    """El comprador SOLO ve el mensaje si ML no lo rechazó en moderación.
+    Ojo: la API devuelve también los mensajes del vendedor rechazados (status 'moderated',
+    message_moderation.status 'rejected', p. ej. reason AUTOMATIC_MESSAGE): esos NO le llegan."""
+    mod = (x.get("message_moderation") or x.get("moderation") or {})
+    return x.get("status", "available") == "available" and str(mod.get("status") or "").lower() != "rejected"
+
 def mensajes_vendedor(ml, pack_id):
     m = ml.get(f"/messages/packs/{pack_id}/sellers/{SELLER_ID}", tag="post_sale", mark_as_read="false")
     if "_http" in m: return None
     return [x for x in m.get("messages", []) if str((x.get("from") or {}).get("user_id")) == SELLER_ID]
 
 def gracias_en_chat(ml, pack_id):
-    """'ok' si el gracias aparece en el chat; 'otro' si hay mensaje del vendedor distinto;
-    'no' si no hay nada del vendedor; None si no se pudo leer."""
+    """'ok' si el gracias está en el chat Y es visible para el comprador; 'rechazado' si está
+    pero ML lo rechazó (no le llega); 'otro' si hay otro mensaje visible del vendedor;
+    'no' si no hay nada visible del vendedor; None si no se pudo leer."""
     mv = mensajes_vendedor(ml, pack_id)
     if mv is None: return None
     obj = _cmp(TEXTO_GRACIAS)[:120]
-    if any(obj in _cmp(_txt(x)) for x in mv): return "ok"
-    return "otro" if mv else "no"
+    es = [x for x in mv if obj in _cmp(_txt(x))]
+    if any(visible(x) for x in es): return "ok"
+    if any(visible(x) for x in mv): return "otro"
+    if es: return "rechazado"
+    return "no"
+
+def motivo_rechazo(ml, pack_id):
+    for x in mensajes_vendedor(ml, pack_id) or []:
+        if not visible(x):
+            return str((x.get("message_moderation") or {}).get("reason") or x.get("status"))
+    return ""
+
+def gracias_para_bot(st, pid, motivo, p, live):
+    """El gracias NO le llegó al comprador: queda en el estado cifrado para que lo mande el bot
+    por el chat de Mercado Libre (navegador). Sin datos personales en logs públicos."""
+    cuenta("gracias_para_bot"); alerta("gracias_pendiente")
+    det("GRACIAS PARA EL BOT", pid, motivo, resumen_pack(p))
+    if live and pid not in st["gracias_para_bot"]:
+        st["gracias_para_bot"][pid] = {"fecha": ahora(), "motivo": motivo, "venta": resumen_pack(p)}
 
 def verificar(ml, pack_id, esperas=(4, 10, 20)):
     r = None
@@ -189,9 +217,11 @@ def ya_agradecido(ml, pack_id):
     """True/False/None(no se puede escribir). Fuente de verdad: el chat del pack."""
     m = ml.get(f"/messages/packs/{pack_id}/sellers/{SELLER_ID}", tag="post_sale", mark_as_read="false")
     if "_http" in m: return None, f"mensajes HTTP {m['_http']}"
-    for x in m.get("messages", []):
-        if str(x["from"]["user_id"]) == SELLER_ID:
-            return True, "el vendedor ya escribió en el chat"
+    mv = [x for x in m.get("messages", []) if str(x["from"]["user_id"]) == SELLER_ID]
+    if any(visible(x) for x in mv):
+        return True, "el vendedor ya escribió en el chat (visible)"
+    if mv:   # hay mensajes del vendedor pero ML los rechazó: el comprador no ve nada
+        return "rechazado", "mensaje del vendedor rechazado por ML (" + motivo_rechazo(ml, pack_id) + ")"
     caps = ml.get(f"/messages/action_guide/packs/{pack_id}/caps_available", tag="post_sale")
     if isinstance(caps, list):
         other = next((c for c in caps if c.get("option_id") == "OTHER"), None)
@@ -229,14 +259,37 @@ def correr_gracias(ml, st, live, packs=None):
         pid = p["pack_id"]
         if "paid" not in p["estados"] or p["estados"] & {"cancelled", "invalid"} or "fraud_risk_detected" in p["tags"]:
             det("OMITIR (no pagada/cancelada)", pid, resumen_pack(p)); cuenta("ventas_omitidas"); continue
-        if pid in st["gracias"]:
+        dd = st["gracias_detalle"].get(pid)
+        pendiente = pid in st["gracias_para_bot"]
+        if pid in st["gracias"] and not pendiente and (dd is None or dd.get("estado") == "visible"):
             cuenta("ventas_ya_agradecidas"); continue
+        if pid in st["gracias"] or pendiente:
+            # enviado por API o pendiente para el bot: se revisa que de verdad sea VISIBLE
+            r = gracias_en_chat(ml, pid)
+            if r in ("ok", "otro"):
+                if live:
+                    if pid not in st["gracias"]: st["gracias"].append(pid)
+                    st["gracias_detalle"].setdefault(pid, {})["estado"] = "visible"
+                    st["gracias_para_bot"].pop(pid, None)
+                det("YA TIENE gracias (visible)", pid, resumen_pack(p)); cuenta("ventas_ya_agradecidas"); continue
+            if r is None:
+                cuenta("errores_api"); continue
+            if live and dd is not None and dd.get("estado") != "rechazado_por_ml":
+                dd["estado"] = "rechazado_por_ml"; dd["motivo"] = motivo_rechazo(ml, pid) or "no visible"
+            gracias_para_bot(st, pid, "el gracias no es visible para el comprador (" +
+                             (motivo_rechazo(ml, pid) or "no hay mensaje") + ")", p, live); continue
         ok, motivo = ya_agradecido(ml, pid)
         if ok is True:
             st["gracias"].append(pid); det("YA TIENE gracias", pid, resumen_pack(p)); cuenta("ventas_ya_agradecidas"); continue
+        if ok == "rechazado":
+            gracias_para_bot(st, pid, motivo, p, live); continue
         if ok is None:
             det("NO SE PUEDE escribir", pid, motivo, resumen_pack(p)); cuenta("ventas_sin_cupo_chat"); continue
         det("SIN GRACIAS ->", pid, resumen_pack(p)); cuenta("ventas_sin_gracias")
+        if not GRACIAS_POR_API:
+            # Mercado Libre RECHAZA el gracias mandado por API (moderación AUTOMATIC_MESSAGE:
+            # "mensaje automático de integrador"); el comprador no lo ve. Queda para el bot.
+            gracias_para_bot(st, pid, "chat vacío: mandar gracias por el chat de ML", p, live); continue
         if not live:
             det(f"[dry-run] mandaria gracias a pack {pid}"); continue
         # Desde aquí el pack queda bloqueado: NUNCA se vuelve a enviar en otra corrida.
@@ -250,10 +303,13 @@ def correr_gracias(ml, st, live, packs=None):
             log(f"envío gracias intento {intento}: HTTP {code}")
             res = verificar(ml, pid)
             if res == "ok": break
-            if res in ("otro", None): break   # hay algo del vendedor o no se pudo leer: no arriesgar duplicado
+            if res in ("otro", None, "rechazado"): break   # hay algo del vendedor o no se pudo leer: no arriesgar duplicado
         d = st["gracias_detalle"][pid]; d["intentos"] = intentos
-        if res == "ok":
-            d["estado"] = "verificado"; enviados += 1; cuenta("gracias_enviados"); cuenta("gracias_verificados")
+        if res == "rechazado":
+            d["estado"] = "rechazado_por_ml"; d["motivo"] = motivo_rechazo(ml, pid)
+            gracias_para_bot(st, pid, "ML rechazó el gracias por API (" + d["motivo"] + ")", p, live)
+        elif res == "ok":
+            d["estado"] = "visible"; enviados += 1; cuenta("gracias_enviados"); cuenta("gracias_verificados")
             avisar_kevin(st, AVISO_KEVIN, live)
         else:
             d["estado"] = "fallido"; d["motivo"] = {"otro": "hay mensaje del vendedor pero no coincide",

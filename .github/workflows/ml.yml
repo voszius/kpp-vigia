@@ -47,5 +47,6 @@ jobs:
           a=$(cat "$f")
           case "$a" in
             *gracias_fallido*) echo "::error::Un gracias no se pudo verificar en el chat: revisar estado (gist)"; exit 1;;
+            *gracias_pendiente*) echo "::warning::Hay ventas sin gracias visible para el bot (estado cifrado): $a";;
             *) echo "::warning::Hay preguntas para el bot: $a";;
           esac
