@@ -247,9 +247,19 @@ def ventas_sin_gracias(ml):
         if offset >= r.get("paging", {}).get("total", 0): break
     return list(packs.values())
 
+def _corto(it):
+    """Nombre simplificado (productos.json), igual que en el mensaje del pedido."""
+    sabor = next((a.get("value_name") for a in it["item"].get("variation_attributes") or []
+                  if a.get("id") == "FLAVOR"), None)
+    try:
+        return formato.linea_producto({"item_id": it["item"]["id"], "titulo": it["item"]["title"],
+                                       "cantidad": int(it["quantity"]), "sabor": sabor})[0]
+    except Exception:
+        return f"{it['quantity']}x {it['item']['title']}"
+
 def resumen_pack(p):
     o = p["orders"][0]
-    prods = "; ".join(f"{it['quantity']}x {it['item']['title']}" for x in p["orders"] for it in x["order_items"])
+    prods = "; ".join(_corto(it) for x in p["orders"] for it in x["order_items"])
     fecha = datetime.fromisoformat(o["date_created"]).astimezone(BOGOTA).strftime("%d-%b %H:%M")
     return f"{fecha} | {o['buyer'].get('nickname')} | {prods}"
 

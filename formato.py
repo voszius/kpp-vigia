@@ -45,7 +45,11 @@ def linea_producto(it, prods=None):
     m = prods.get(it["item_id"])
     if m:
         u = int(m.get("por_unidad", 1)) * int(it["cantidad"])
-        nom = m["nombre"] + (f" {it['sabor'].lower()}" if m.get("con_sabor") and it.get("sabor") else "")
+        sab = (it.get("sabor") or "").strip().lower()
+        if sab and sab in (m.get("por_sabor") or {}):
+            nom = m["por_sabor"][sab]                      # p. ej. Ucol Jarabe cereza se manda como Vcol
+        else:
+            nom = m["nombre"] + (f" {sab}" if m.get("con_sabor") and sab else "")
         return f"{u} {nom}", u, bool(m.get("revisar"))
     x = re.search(r"\bX\s?(\d+)\b", it.get("titulo") or "", re.I)
     u = (int(x.group(1)) if x else 1) * int(it["cantidad"])
